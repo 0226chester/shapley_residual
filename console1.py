@@ -23,7 +23,7 @@ def generate_partition(f_part):  #input a dict
     return all_subsets, subset_index_table, len(all_subsets)
 
 
-class Hypercube_wpart:
+class NewHypercube:
     '''
     A class to create a hypercube object which stores values of vertices
     '''    
@@ -106,34 +106,64 @@ class Hypercube_wpart:
     def get_partial_gradient_vector(self,subset_i):  #feature->subset->allow input int or tuple
         if isinstance(subset_i, int):
             feature_i = self.get_elements(subset_i)
+            partial_gradient_vector = np.zeros(self.edge_num)
+            for i,v_pair in enumerate(self.edges):
+                if (not set(feature_i).issubset(set(v_pair[0]))) and (set(feature_i).issubset(set(v_pair[1]))):
+                    partial_gradient_vector[i] = self.vertex_values[tuple(v_pair[1])]-self.vertex_values[tuple(v_pair[0])]    
+            return partial_gradient_vector
         else:
-            feature_i = []            
-            for i in subset_i:
-                feature_i.append(self.get_elements(i))
-            feature_i = tuple(chain.from_iterable(feature_i))
-        partial_gradient_vector = np.zeros(self.edge_num)
-        for i,v_pair in enumerate(self.edges):
-            if (not set(feature_i).issubset(set(v_pair[0]))) and (set(feature_i).issubset(set(v_pair[1]))):
-                partial_gradient_vector[i] = self.vertex_values[tuple(v_pair[1])]-self.vertex_values[tuple(v_pair[0])]    
-        return partial_gradient_vector
+            sub_hypercube, idx = self.make_sub_hypercube(subset_i)
+            partial_gradient_vector = sub_hypercube.get_partial_gradient_vector(idx)
+            return partial_gradient_vector
     
     def resolve_vi(self, subset_i, phi_0=0):  #feature->subset
-        pgd = self.get_partial_gradient_vector(subset_i)
-        # Append equation x_0=0 at the end of partial gradient vector.
-        pgd = np.append(pgd, phi_0)
-        vi = self.weight_matrix @ pgd
-        # Reconstruct the vertex values
-        new_vertices = {}
-        for i,v in enumerate(self.vertices):
-            new_vertices[tuple(v)] = vi[i]
-        return vi, new_vertices
+        if isinstance(subset_i, int):
+            pgd = self.get_partial_gradient_vector(subset_i)
+            # Append equation x_0=0 at the end of partial gradient vector.
+            pgd = np.append(pgd, phi_0)
+            vi = self.weight_matrix @ pgd
+            # Reconstruct the vertex values
+            new_vertices = {}
+            for i,v in enumerate(self.vertices):
+                new_vertices[tuple(v)] = vi[i]
+            return vi, new_vertices
+        else:
+            sub_hypercube, idx = self.make_sub_hypercube(subset_i)
+            vi, new_vertices = sub_hypercube.resolve_vi(idx)
+            return vi, new_vertices
 
+    def new_groups(self, subset_i):
+        #new feature grouping dict for sub_hypercube
+        subsets = [self.get_elements(i) for i in subset_i]            
+        flattened_subsets = sorted([ele for tup in subsets for ele in tup])            
+        feature_grouping_list = [value for key, value in self.f_part.items() if key not in subset_i]
+        feature_grouping_list.append(flattened_subsets)
+        feature_grouping_list = sorted(feature_grouping_list, key=lambda x: x[0])           
+        new_grouping = {key: value for key, value in  enumerate(feature_grouping_list)}
+        idx = feature_grouping_list.index(flattened_subsets)
+        #print(f'new_grouping: {new_grouping} with index {idx}')
+        return new_grouping, idx  #idx should replace subset_i after this
+
+    def make_sub_hypercube(self, subset_i):
+        #return a cube with vertex values
+        new_grouping, idx = self.new_groups(subset_i)               
+        _, ft, _ = generate_partition(new_grouping)
+        ft_list = [i for i in ft.keys()]       
+        vertices = {key: self.vertex_values[key] for key in ft_list}   #self.vertex_values should be setted well
+        sub_hypercube = NewHypercube(new_grouping)
+        sub_hypercube.set_vertex_values(vertices)
+        #print(f'new vertex values: {sub_hypercube.vertex_values}')        
+        return sub_hypercube, idx
+
+    def reset_vertex_values(self):       
+        self.vertex_values = {}
+        
 
 def make_cube_list(vertex_df, F_P):  #input vertex dataframe and return a list of cubes for instances
     subsets, _, _ = generate_partition(F_P)
     cubelist = []
     for idx in range(vertex_df.shape[0]):
-        tp = Hypercube_wpart(F_P)
+        tp = NewHypercube(F_P)
         vertices = {}
         values = vertex_df.iloc[idx].tolist()
         for v in subsets:
@@ -153,13 +183,27 @@ def single_subset_norm(cubelist,F_P):
             pgd = cubelist[i].get_partial_gradient_vector(j)  #partial gradient of instance i of subset j 
             pg_m[i][j] = pgd
             vi, new_vs = cubelist[i].resolve_vi(j)
-            h1 = Hypercube_wpart(F_P)
+            h1 = NewHypercube(F_P)
             h1.set_vertex_values(new_vs)
             dvi = h1.get_gradient_vector()
             residual_m[i][j] = dvi-pgd
+            # print(f'residual_m[{i}][{j}]')
+            # print(residual_m[i][j])
+    
     #l2 norm for single subset    
     pgd_l2 = [[float(np.linalg.norm(pg_m[i][j])) for j in range(cols)] for i in range(rows)]
     r_l2 = [[float(np.linalg.norm(residual_m[i][j])) for j in range(cols)] for i in range(rows)]
+    #div 0
+    zero_positions = []
+    for row_index, row in enumerate(pgd_l2):
+        for col_index, element in enumerate(row):
+            if element == 0.0:
+                zero_positions.append((row_index, col_index))
+    if len(zero_positions):
+        print("Zero positions in the matrix:")
+        for position in zero_positions:
+            print(position)
+
     scaled_norm = [[float(r_l2[i][j] / pgd_l2[i][j]) for j in range(cols)] for i in range(rows)]
     scn_df = pd.DataFrame(scaled_norm)
     pgd_df = pd.DataFrame(pgd_l2)
@@ -184,7 +228,8 @@ def two_subset_norm(cubelist,F_P):
             pg = cubelist[i].get_partial_gradient_vector(combo[j])  #partial gradient of instance i of subset j 
             pg_m[i][j] = pg
             vi, new_vs = cubelist[i].resolve_vi(combo[j])
-            h1 = Hypercube_wpart(F_P)
+            h1, _ = cubelist[i].make_sub_hypercube(combo[j])
+            h1.reset_vertex_values()
             h1.set_vertex_values(new_vs)
             dvi = h1.get_gradient_vector()
             residual_m[i][j] = dvi-pg    
